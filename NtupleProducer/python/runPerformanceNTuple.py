@@ -12,11 +12,11 @@ process.load('Configuration.StandardSequences.Services_cff')
 process.load("SimGeneral.HepPDTESSource.pythiapdt_cfi")
 process.load("FWCore.MessageLogger.MessageLogger_cfi")
 process.options   = cms.untracked.PSet( wantSummary = cms.untracked.bool(True), allowUnscheduled = cms.untracked.bool(False) )
-process.maxEvents = cms.untracked.PSet( input = cms.untracked.int32(1))
+process.maxEvents = cms.untracked.PSet( input = cms.untracked.int32(1000))
 process.MessageLogger.cerr.FwkReport.reportEvery = 1
 
 process.source = cms.Source("PoolSource",
-    fileNames = cms.untracked.vstring('file:/eos/cms/store/cmst3/group/l1tr/FastPUPPI/15_1_X/fpinputs_140X/v1/TT_TuneCP5_14TeV-powheg-pythia8/TT_PU200_151Xv0/250910_165631/0000/inputs151X_1-100.root'),
+    fileNames = cms.untracked.vstring('file:/eos/cms/store/cmst3/group/l1tr/FastPUPPI/15_1_X/fpinputs_140X/v1/GluGluHToGG_M-125_TuneCP5_14TeV-powheg-pythia8/GluGluHToGG_PU200_140Xv1/260204_150531/0000/inputs140X_3.root'),
     #fileNames = cms.untracked.vstring('file:/eos/cms/store/cmst3/group/l1tr/FastPUPPI/15_1_X/fpinputs_140X/v1/TT_TuneCP5_14TeV-powheg-pythia8/TT_PU0_140Xv1/INFP/140Xv1/inputs140X_16186389_939.root'),
     #fileNames = cms.untracked.vstring('file:inputs125X.root'),
     inputCommands = cms.untracked.vstring("keep *", 
@@ -859,4 +859,4 @@ def saveGenCands():
 
 
 saveCands();
-#saveGenCands();                                                                                                                                                                          
+#saveGenCands();  

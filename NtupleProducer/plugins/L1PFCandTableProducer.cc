@@ -22,7 +22,16 @@
 #include "L1Trigger/Phase2L1ParticleFlow/interface/L1TPFUtils.h"
 
 #include <algorithm>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <unordered_set>
 
+// ---------------------------------------------------------------
+// Class: L1PFCandTableProducer
+// ---------------------------------------------------------------
 class L1PFCandTableProducer : public edm::global::EDProducer<>  {
     public:
         explicit L1PFCandTableProducer(const edm::ParameterSet&);
@@ -65,6 +74,7 @@ L1PFCandTableProducer::L1PFCandTableProducer(const edm::ParameterSet& iConfig) :
     }
 
     gencands_.emplace_back("GenCands", consumes<reco::CandidateView>(edm::InputTag("genParticlesForMETAllVisible")), iConfig);
+    //gencands_.emplace_back("GenCands", consumes<reco::CandidateView>(edm::InputTag("genInAcceptance")), iConfig);
 
     if (iConfig.existsAs<edm::ParameterSet>("moreVariables")) {
         edm::ParameterSet vars = iConfig.getParameter<edm::ParameterSet>("moreVariables");
@@ -81,214 +91,357 @@ double calculate_deltaR(double eta1, double phi1, double eta2, double phi2) {
 
 L1PFCandTableProducer::~L1PFCandTableProducer() { }
 
-struct GenCounts {
-    int nGenInCone = 0;
-    int nGenStatus1InCone = 0;
-    int nGenPtThrInCone = 0;
-    int nGenStatus1PtThrInCone = 0;
 
-    int nChargedGenInCone = 0;
-    int nChargedGenStatus1InCone = 0;
-    int nChargedGenPt2InCone = 0;
-    int nChargedGenStatus1Pt2InCone = 0;
+// =====================================================================================
+// PUPPI ML at L1: Target studies
+// Studying gen ratios + multiplicities around *neutral RECO seeds only* (dR = 0.2)
+//   - Three categories (both RECO and GEN):
+//       1) charged-around-neutral-seed   (includes seed only if it is charged -> never, since seed is neutral)
+//       2) neutral-around-neutral-seed   (includes seed)
+//       3) all-around-neutral-seed       (includes seed)
+//   - GEN thresholds kept: charged >2 GeV, neutral >1 GeV (status==1 for sums/counts)
+//   - Keep matching logic (isGenMatched) using GEN status1 passing thresholds within dR < 0.2
+//   - Keep suspicious printout (~0.5 bulk) + add "Gen sum peaking at zero"
+// =====================================================================================
 
-    int nNeutralGenInCone = 0;
-    int nNeutralGenStatus1InCone = 0;
-    int nNeutralGenPt1InCone = 0;
-    int nNeutralGenStatus1Pt1InCone = 0;
+static inline double dR(double eta1,double phi1,double eta2,double phi2){
+  return reco::deltaR(eta1,phi1,eta2,phi2);
+}
 
-    int nChargedHadGenInCone = 0;
-    int nChargedHadGenStatus1InCone = 0;
-    int nChargedHadGenPt2InCone = 0;
-    int nChargedHadGenStatus1Pt2InCone = 0;
+static inline std::pair<double,double> caloEtaPhi(const reco::Candidate* c, double bz) {
+  math::XYZTLorentzVector vtx(c->vx(), c->vy(), c->vz(), 0.);
+  return l1tpf::propagateToCalo(c->p4(), vtx, c->charge(), bz);
+}
 
-    int nNeutralHadGenInCone = 0;
-    int nNeutralHadGenStatus1InCone = 0;
-    int nNeutralHadGenPt1InCone = 0;
-    int nNeutralHadGenStatus1Pt1InCone = 0;
+// A "good enough" uniqueness signature w/o references/pointers.
+// If you later have unique keys in ntuples, swap this for those.
+static inline std::string recoKeyNoRef(const reco::Candidate* c, double bz) {
+  auto calo = caloEtaPhi(c,bz);
+  std::ostringstream ss;
+  ss << c->pdgId() << "_"
+     << c->charge() << "_"
+     << std::fixed << std::setprecision(3)
+     << c->pt() << "_"
+     << calo.first << "_"
+     << calo.second;
+  return ss.str();
+}
+
+struct ConeMult {
+  // RECO (seed excluded)
+  int nRecoAll=0, nRecoCh=0, nRecoNe=0;
+  int nRecoPho=0, nRecoNHad=0, nRecoChHad=0;
+
+  // GEN (all in cone, seed doesn't exist on gen side)
+  int nGenAll=0, nGenCh=0, nGenNe=0;
+  int nGenPho=0, nGenNHad=0, nGenChHad=0;
+
+  // GEN (status1 + thresholds) in cone  <-- THIS is what you requested
+  int nGenS1ThrAll=0, nGenS1ThrCh=0, nGenS1ThrNe=0;
+  int nGenS1ThrPho=0, nGenS1ThrNHad=0, nGenS1ThrChHad=0;
 };
 
-struct PtSums {
-    double genPtSum = 0, genNeutralPtSum = 0, genChargedPtSum = 0, genChargedPtHadSum = 0, genNeutralPtHadSum = 0;
-    double recoPtSum = 0, recoNeutralPtSum = 0, recoChargedPtSum = 0, recoChargedPtHadSum = 0, recoNeutralPtHadSum = 0;
-    double genRecoRatio = 0;
-    int isGenMatched = 0;
-    GenCounts counts;
+struct CatSums {
+  // "Sum" means pT sum passing thresholds (GEN) and simply pT sum (RECO).
+  // GEN uses: status==1 AND (charged>2 or neutral>1), and then category filter.
+  double recoSum=0.0;
+  double genSum=0.0;
+  double ratio() const { return (recoSum>0 ? genSum/recoSum : -1.0); }
 };
 
-// ----------------------------------------------------------------------
-// Mask that defines which GEN-count columns to create for each category
-// ----------------------------------------------------------------------
-struct GenColumnMask {
-    bool makePtThr = false;  // GEN-only
-    bool makePt1   = false;  // neutrals
-    bool makePt2   = false;  // charged
+struct ConeResult {
+  CatSums ch;   // (closure) charged-only in cone
+  CatSums ne;   // (closure) neutral-only in cone
+  CatSums all;  // (closure) all in cone
+  ConeMult mult;
+
+  // 3 categories around the neutral seed: (PU-correction denominators) seed + X
+  double recoDen_seedPlusCh  = 0.0;
+  double recoDen_seedPlusNe  = 0.0;
+  double recoDen_seedPlusAll = 0.0;
+
+  int isGenMatched = 0; 
+  double seedCaloEta=0., seedCaloPhi=0.;
+
+  // new: matched neutral GEN info
+  float matchedGenNeutralPt = 0.f;   // 0 if none
+  int   hasMatchedGenNeutral = 0;    // 1 if found
+  double genChargedPlusMatchedNeutral = 0.0;
+  int matchedGenNeutralPdgId = 0;
+  float matchedGenNeutralDR  = -1.f;
 };
 
+// --- GEN classification (status1 + thresholds) ---
+static inline bool genIsStatus1(const reco::GenParticle* gp){ return gp && gp->status()==1; }
+static inline bool genIsNeutral(const reco::Candidate* c){ return c->charge()==0; }
+static inline bool genPassThr(const reco::Candidate* c){
+  // thresholds requested:
+  //   - neutral >1 GeV
+  //   - charged >2 GeV
+  //if (c->charge()==0) return c->pt() > 1.0;
+  //return c->pt() > 2.0;
+  if (c->charge()==0) return c->pt() > 1.0;
+  return c->pt() > 2.0;
+}
 
-PtSums computePtSumsForCone(
-    const reco::Candidate* cand,
-    const std::vector<const reco::Candidate*>& selected,
+static inline bool recoIsNeutral(const reco::Candidate* c){ return c->charge()==0; }
+
+static inline void printConeDebugFull(
+    const edm::EventID& eid,
+    const reco::Candidate* seed,
+    const std::vector<const reco::Candidate*>& reco_selected,
     const std::vector<const reco::Candidate*>& gen_selected,
+    const ConeResult& out,
     double coneSize,
     double bz
-) {
-    PtSums sums;
+){
+  auto seedCalo = caloEtaPhi(seed,bz);
 
-    math::XYZTLorentzVector vertex(cand->vx(), cand->vy(), cand->vz(), 0.);
-    auto caloetaphi = l1tpf::propagateToCalo(cand->p4(), vertex, cand->charge(), bz);
-    double eta1 = (cand->charge() == 0) ? caloetaphi.first : cand->eta();
-    double phi1 = (cand->charge() == 0) ? caloetaphi.second : cand->phi();
+  const float r_ch  = (out.recoDen_seedPlusCh  > 0) ? (out.genChargedPlusMatchedNeutral / out.recoDen_seedPlusCh)  : -1.f;
+  const float r_ne  = (out.recoDen_seedPlusNe  > 0) ? (out.ne.genSum / out.recoDen_seedPlusNe)  : -1.f;
+  const float r_all = (out.recoDen_seedPlusAll > 0) ? (out.all.genSum / out.recoDen_seedPlusAll) : -1.f;
 
-    // ---- RECO loop ----
-    for (unsigned int j = 0; j < selected.size(); ++j) {
-        const auto* other = selected[j];
-        if (cand == other) continue;
+  std::cout << "\n============================================================\n";
+  std::cout << "EVENT " << eid.run() << ":" << eid.luminosityBlock() << ":" << eid.event() << "\n";
+  std::cout << "SEED  pdgId=" << seed->pdgId()
+            << " q=" << seed->charge()
+            << " pt=" << seed->pt()
+            << " eta=" << seed->eta()
+            << " phi=" << seed->phi()
+            << " calo(eta,phi)=" << seedCalo.first << "," << seedCalo.second
+            << "\n";
 
-        math::XYZTLorentzVector vertex2(other->vx(), other->vy(), other->vz(), 0.);
-        auto caloetaphi2 = l1tpf::propagateToCalo(other->p4(), vertex2, other->charge(), bz);
-        double eta2 = (other->charge() == 0) ? caloetaphi2.first : other->eta();
-        double phi2 = (other->charge() == 0) ? caloetaphi2.second : other->phi();
+  std::cout << "-- MATCH --\n";
+  std::cout << " hasMatchedGenNeutral=" << out.hasMatchedGenNeutral
+            << " \n matchedGenNeutralPt=" << out.matchedGenNeutralPt
+            << " matchedGenNeutralPdgId=" << out.matchedGenNeutralPdgId
+            << " matchedGenNeutralDR=" << out.matchedGenNeutralDR
+            << "\n";
 
-        double deltaR = calculate_deltaR(eta1, phi1, eta2, phi2);
-        if (deltaR >= coneSize) continue;
+  std::cout << "\n-- NUMERATORS (status1+thr) --\n";
+  std::cout << " genChargedPtSum0p2=" << out.ch.genSum << "\n";
+  std::cout << " genNeutralPtSum0p2=" << out.ne.genSum << "\n";
+  std::cout << " genPtSum0p2=" << out.all.genSum << "\n";
+  std::cout << " genChPlusMatchedNe0p2=" << out.genChargedPlusMatchedNeutral << "\n";
 
-        sums.recoPtSum += other->pt();
-        if (other->charge() == 0) sums.recoNeutralPtSum += other->pt();
-        else sums.recoChargedPtSum += other->pt();
-        if (abs(other->pdgId()) == 211) {
-	  sums.recoChargedPtHadSum += other->pt();
-	  //std::cout << "RECO CHARGED (pdgId() = 211), pt = " << other->pt() << std::endl;
-	}
-        if (abs(other->pdgId()) == 130) {
-	  sums.recoNeutralPtHadSum += other->pt();
-	  //std::cout << "RECO NEUTRAL (pdgId() = 130), pt = " << other->pt() << std::endl;
-	}
+  std::cout << "\n-- DENOMINATORS (seed+RECO in cone) --\n";
+  std::cout << " recoDen_seedPlusCh0p2=" << out.recoDen_seedPlusCh << "\n";
+  std::cout << " recoDen_seedPlusNe0p2=" << out.recoDen_seedPlusNe << "\n";
+  std::cout << " recoDen_seedPlusAll0p2=" << out.recoDen_seedPlusAll << "\n";
+
+  std::cout << "\n-- RATIOS --\n";
+  std::cout << " ratioPU_ch=" << r_ch << "  ratioPU_ne=" << r_ne << "  ratioPU_all=" << r_all << "\n";
+
+  std::cout << "-- MULT (RECO, seed excluded) --\n";
+  std::cout << " RECO all=" << out.mult.nRecoAll << " ch=" << out.mult.nRecoCh << " ne=" << out.mult.nRecoNe
+            << " pho=" << out.mult.nRecoPho << " nHad=" << out.mult.nRecoNHad << " chHad=" << out.mult.nRecoChHad
+            << "\n";
+
+  std::cout << "-- MULT (GEN all in cone) --\n";
+  std::cout << " GEN all=" << out.mult.nGenAll << " ch=" << out.mult.nGenCh << " ne=" << out.mult.nGenNe
+            << " pho=" << out.mult.nGenPho << " nHad=" << out.mult.nGenNHad << " chHad=" << out.mult.nGenChHad
+            << "\n";
+
+  std::cout << "-- MULT (GEN status1+thr in cone) --\n";
+  std::cout << " GEN_s1thr all=" << out.mult.nGenS1ThrAll << " ch=" << out.mult.nGenS1ThrCh << " ne=" << out.mult.nGenS1ThrNe
+            << " \n\t pho=" << out.mult.nGenS1ThrPho << " nHad=" << out.mult.nGenS1ThrNHad << " chHad=" << out.mult.nGenS1ThrChHad
+            << "\n";
+
+  // ---- full lists ----
+  std::cout << "\n-- RECO in cone (seed excluded) --\n";
+  {
+    std::unordered_set<std::string> seen;
+    for (const auto* c : reco_selected) {
+      if (c == seed) continue;
+      const std::string k = recoKeyNoRef(c,bz);
+      if (!seen.insert(k).second) continue;
+
+      auto calo = caloEtaPhi(c,bz);
+      const double dr = dR(seedCalo.first,seedCalo.second,calo.first,calo.second);
+      if (dr >= coneSize) continue;
+
+      std::cout << " reco: pt=" << std::setw(7) << c->pt()
+                << " eta=" << std::setw(7) << c->eta()
+                << " phi=" << std::setw(7) << c->phi()
+                << " pdgId=" << std::setw(6) << c->pdgId()
+                << " q=" << std::setw(2) << c->charge()
+                << " dR=" << dr
+                << "\n";
     }
+  }
 
-    // include self    
-    //std::cout << "RECO Candidate pt = " << cand->pt() << std::endl;
-    //std::cout << "\t\t with pdgId() = " << abs(cand->pdgId()) << std::endl;
-    //std::cout << "\t\t and charge   = " << cand->charge() << std::endl;
-    //std::cout << "---------------------------------------------" << std::endl;
-    sums.recoPtSum += cand->pt();
-    if (cand->charge() == 0) sums.recoNeutralPtSum += cand->pt();
-    else sums.recoChargedPtSum += cand->pt();
-    if (abs(cand->pdgId()) == 211) sums.recoChargedPtHadSum += cand->pt();
-    if (abs(cand->pdgId()) == 130) sums.recoNeutralPtHadSum += cand->pt();
+  std::cout << "\n-- GEN in cone (ALL) --\n";
+  for (const auto* g : gen_selected) {
+    const auto* gp = dynamic_cast<const reco::GenParticle*>(g);
+    if (!gp) continue;
 
-    // ---- GEN loop (status == 1 only) ----
-    double min_dR = 999.;
+    auto calo = caloEtaPhi(g,bz);
+    const double dr = dR(seedCalo.first,seedCalo.second,calo.first,calo.second);
+    if (dr >= coneSize) continue;
 
-    for (unsigned int k = 0; k < gen_selected.size(); ++k) {
-        const auto* gen = gen_selected[k];
-        const reco::GenParticle* gp = dynamic_cast<const reco::GenParticle*>(gen);
-	if (!gp) continue; // keep ALL status types
-	//if (!gp || gp->status() != 1) continue; // Only stable since the beginning of the gen loop
+    const bool thr = genPassThr(g);
 
-        math::XYZTLorentzVector vertex3(gen->vx(), gen->vy(), gen->vz(), 0.);
-        auto caloetaphi3 = l1tpf::propagateToCalo(gen->p4(), vertex3, gen->charge(), bz);
-        double eta3 = (gen->charge() == 0) ? caloetaphi3.first : gen->eta();
-        double phi3 = (gen->charge() == 0) ? caloetaphi3.second : gen->phi();
+    std::cout << " gen:  pt=" << std::setw(7) << g->pt()
+              << " eta=" << std::setw(7) << g->eta()
+              << " phi=" << std::setw(7) << g->phi()
+              << " pdgId=" << std::setw(6) << gp->pdgId()
+              << " q=" << std::setw(2) << g->charge()
+              << " st=" << std::setw(2) << gp->status()
+              << " passThr=" << (thr ? 1 : 0)
+              << " dR=" << dr
+              << "\n";
+  }
 
-        double deltaR = calculate_deltaR(eta1, phi1, eta3, phi3);
-        if (deltaR < min_dR) {
-            min_dR = deltaR;
-        }
-
-        if (deltaR >= coneSize) continue;
-
-	// --- Classification booleans variables ---
-	bool isStatus1      = (gp->status() == 1);
-	bool isNeutral = (gen->charge() == 0);
-	bool passNeutral = (isNeutral && gen->pt() > 1);
-	bool passCharged = (!isNeutral && gen->pt() > 2);
-	
-	bool isChargedHad = (abs(gp->pdgId()) == 211);
-	bool isNeutralHad = (abs(gp->pdgId()) == 130);
-	
-	bool passChargedHad = (isChargedHad && gen->pt() > 2);
-	bool passNeutralHad = (isNeutralHad && gen->pt() > 1);
-	bool passGenPtThr   = (passNeutral || passCharged);
-	
-	// --- Generic GEN counts (ALL) ---
-	sums.counts.nGenInCone++;
-	if (isStatus1)
-	  sums.counts.nGenStatus1InCone++;
-	
-	if (passGenPtThr) {
-	  sums.counts.nGenPtThrInCone++;
-	  if (isStatus1)
-	    sums.counts.nGenStatus1PtThrInCone++;
-	}
-	
-	// --- Charged vs neutral counts ---
-	if (!isNeutral) {
-	  // charged
-	  sums.counts.nChargedGenInCone++;
-	  if (isStatus1) sums.counts.nChargedGenStatus1InCone++;
-	  
-	  if (passCharged) {
-	    sums.counts.nChargedGenPt2InCone++;
-	    if (isStatus1) sums.counts.nChargedGenStatus1Pt2InCone++;
-	  }
-	} else {
-	  // neutral
-	  sums.counts.nNeutralGenInCone++;
-	  if (isStatus1) sums.counts.nNeutralGenStatus1InCone++;
-	  
-	  if (passNeutral) {
-	    sums.counts.nNeutralGenPt1InCone++;
-	    if (isStatus1) sums.counts.nNeutralGenStatus1Pt1InCone++;
-	  }
-	}
-	
-	// --- Hadrons ---
-	if (isChargedHad) {
-	  sums.counts.nChargedHadGenInCone++;
-	  if (isStatus1) sums.counts.nChargedHadGenStatus1InCone++;
-	  
-	  if (passChargedHad) {
-	    sums.counts.nChargedHadGenPt2InCone++;
-	    if (isStatus1) sums.counts.nChargedHadGenStatus1Pt2InCone++;
-	  }
-	}
-	
-	if (isNeutralHad) {
-	  sums.counts.nNeutralHadGenInCone++;
-	  if (isStatus1) sums.counts.nNeutralHadGenStatus1InCone++;
-	  
-	  if (passNeutralHad) {
-	    sums.counts.nNeutralHadGenPt1InCone++;
-	    if (isStatus1) sums.counts.nNeutralHadGenStatus1Pt1InCone++;
-	  }
-	}
-	
-	
-	// --- pT sums (status==1 only) ---
-	if (passNeutral || passCharged)
-	  sums.genPtSum += gen->pt();
-	
-	if (passNeutral)
-	  sums.genNeutralPtSum += gen->pt();
-	
-	if (passCharged)
-	  sums.genChargedPtSum += gen->pt();
-	
-	if (abs(gen->pdgId()) == 211 && passCharged)
-	  sums.genChargedPtHadSum += gen->pt();
-	
-	if (abs(gen->pdgId()) == 130 && passNeutral)
-	  sums.genNeutralPtHadSum += gen->pt();		
-    
-        // gen matching flag; 
-	if (((min_dR < 0.1) && isStatus1) && (passNeutral || passCharged)) sums.isGenMatched = 1;
-    }
-
-    sums.genRecoRatio = (sums.recoPtSum > 0) ? sums.genPtSum / sums.recoPtSum : 0.0;
-
-    return sums;
+  std::cout << "============================================================\n";
 }
+
+// ----------------------------------------------------------------------
+// Main worker: neutral RECO seed only
+// ----------------------------------------------------------------------
+static inline ConeResult computeConeAroundNeutralRecoSeed(
+    const reco::Candidate* seed,
+    const std::vector<const reco::Candidate*>& reco_selected,
+    const std::vector<const reco::Candidate*>& gen_selected,
+    double coneSize, // use 0.2
+    double bz
+){
+  ConeResult out;
+
+  // enforce: seed must be neutral reco
+  auto seedCalo = caloEtaPhi(seed,bz);
+  out.seedCaloEta = seedCalo.first;
+  out.seedCaloPhi = seedCalo.second;
+
+  // --------------------------
+  // RECO loop (unique-by-key)
+  // --------------------------
+  std::unordered_set<std::string> seenRecoKeys;
+  seenRecoKeys.reserve(reco_selected.size()*2);
+
+  out.recoDen_seedPlusCh  = seed->pt();
+  out.recoDen_seedPlusNe  = seed->pt();
+  out.recoDen_seedPlusAll = seed->pt();
+  
+  for (const auto* c : reco_selected) {
+    if (c == seed) continue;
+    
+    // unique protection (no refs, no pointers)
+    const std::string key = recoKeyNoRef(c,bz);
+    if (!seenRecoKeys.insert(key).second) continue;
+
+    auto calo = caloEtaPhi(c,bz);
+    const double dr = dR(out.seedCaloEta,out.seedCaloPhi,calo.first,calo.second);
+    if (dr >= coneSize) continue;
+
+    // closure sums (NO seed here)
+    out.all.recoSum += c->pt();
+    if (c->charge()==0) out.ne.recoSum += c->pt();
+    else                out.ch.recoSum += c->pt();
+
+    // seed+X denominators (seed already included above)
+    out.recoDen_seedPlusAll += c->pt();
+    if (c->charge()==0) out.recoDen_seedPlusNe += c->pt();
+    else                out.recoDen_seedPlusCh += c->pt();
+    
+    // multiplicities
+    out.mult.nRecoAll++;
+    if (c->charge()==0) out.mult.nRecoNe++; else out.mult.nRecoCh++;
+    const int apdg = std::abs(c->pdgId());
+    if (apdg==22)  out.mult.nRecoPho++;
+    if (apdg==130) out.mult.nRecoNHad++;
+    if (apdg==211) out.mult.nRecoChHad++;
+
+  }
+
+  // -------------------------------------------------------------------------
+  // GEN loop (all-in-cone mult) + (status1+thr sums+mult) + improved matching
+  // -------------------------------------------------------------------------
+  const double matchDR  = 0.2;
+  const double relPtTol = 0.5;
+
+  double bestDR = 1e9;
+  const reco::GenParticle* bestGenNeutral = nullptr;
+
+  for (const auto* g : gen_selected) {
+    const auto* gp = dynamic_cast<const reco::GenParticle*>(g);
+    if (!gp) continue;
+
+    auto calo = caloEtaPhi(g,bz);
+    const double dr = dR(out.seedCaloEta,out.seedCaloPhi,calo.first,calo.second);
+    if (dr >= coneSize) continue;
+
+    // --- GEN multiplicities (ALL, no status/thr) ---
+    out.mult.nGenAll++;
+    if (g->charge()==0) out.mult.nGenNe++; else out.mult.nGenCh++;
+    const int apdg = std::abs(gp->pdgId());
+    if (apdg==22)  out.mult.nGenPho++;
+    if (apdg==130) out.mult.nGenNHad++;
+    if (apdg==211) out.mult.nGenChHad++;
+
+    // --- status1 + thresholds gate ---
+    if (!genIsStatus1(gp)) continue;
+    if (!genPassThr(g)) continue;
+
+    // --- GEN multiplicities (status1+thr) ---
+    out.mult.nGenS1ThrAll++;
+    if (g->charge()==0) out.mult.nGenS1ThrNe++; else out.mult.nGenS1ThrCh++;
+    if (apdg==22)  out.mult.nGenS1ThrPho++;
+    if (apdg==130) out.mult.nGenS1ThrNHad++;
+    if (apdg==211) out.mult.nGenS1ThrChHad++;
+
+    // --- sums (status1+thr only) ---
+    out.all.genSum += g->pt();
+    if (g->charge()==0) out.ne.genSum += g->pt();
+    else                out.ch.genSum += g->pt();
+
+    // --- improved matching: neutral only, pt-compatible, best DR ---
+    if (g->charge() != 0) continue;
+
+    const double rel = (seed->pt()>0 ? std::abs(g->pt()-seed->pt())/seed->pt() : 999.);
+    if (rel > relPtTol) continue;
+
+    if (dr < bestDR) { bestDR = dr; bestGenNeutral = gp; }
+
+    // --- Matching candidate: GEN neutral (status1+thr already enforced above) ---
+    /* //GOOD
+       if (g->charge() == 0) {
+       if (dr < bestMatchDR) {
+       bestMatchDR = dr;
+       bestGenNeutral = g;
+	}
+    }
+    */  
+
+    // keep matching logic: "any passing status1 gen within cone" -> matched
+    //out.isGenMatched = 1;
+
+    // [1] bestMatchDR
+    /*
+    if (genIsStatus1(gp) && g->charge()==0 && genPassThr(g)) {
+      //std::cout << "dr = " << dr << " and bestMatchDR = " << bestMatchDR << std:: endl;
+      if (dr < bestMatchDR) {
+	bestMatchDR = dr;
+	bestGenMatch = g;
+      }
+    }
+    */
+
+  }
+
+  // finalize match result
+  out.hasMatchedGenNeutral = (bestGenNeutral && bestDR < matchDR) ? 1 : 0;
+  out.isGenMatched         = out.hasMatchedGenNeutral;
+
+  out.matchedGenNeutralPt    = out.hasMatchedGenNeutral ? bestGenNeutral->pt()    : 0.f;
+  out.matchedGenNeutralPdgId = out.hasMatchedGenNeutral ? bestGenNeutral->pdgId() : 0;
+  out.matchedGenNeutralDR    = out.hasMatchedGenNeutral ? bestDR                 : -1.f;
+
+  // charged numerator + matched neutral (no double counting)
+  out.genChargedPlusMatchedNeutral = out.ch.genSum + out.matchedGenNeutralPt;
+
+  return out;  
+}
+
 
 void
 L1PFCandTableProducer::produce(edm::StreamID id, edm::Event& iEvent, const edm::EventSetup& iSetup) const
@@ -297,7 +450,7 @@ L1PFCandTableProducer::produce(edm::StreamID id, edm::Event& iEvent, const edm::
     std::vector<const reco::Candidate *> selected;
     std::vector<const reco::Candidate *> gen_selected;
     std::vector<float> vals_pt, vals_eta, vals_phi, vals_mass;
-
+    
     // ---- collect GEN candidates ----
     for (auto & gencands : gencands_) {
         iEvent.getByToken(gencands.src, src);
@@ -314,6 +467,10 @@ L1PFCandTableProducer::produce(edm::StreamID id, edm::Event& iEvent, const edm::
         }
 
         unsigned int ncands = selected.size();
+	std::vector<float> vals_caloeta(ncands, 0.f);
+	std::vector<float> vals_calophi(ncands, 0.f);
+	//std::cout << "---------------------> Selected size=" << selected.size() << std::endl;
+	
         auto out = std::make_unique<nanoaod::FlatTable>(ncands, cands.coll+"Cands", false);
 
         // ---- fill basic info ----
@@ -339,354 +496,166 @@ L1PFCandTableProducer::produce(edm::StreamID id, edm::Event& iEvent, const edm::
             out->addColumn<float>(evar.name, vals_pt, evar.expr);
         }
 
-        const float bz = 3.8112;
-
         // ---- allocate output vectors ----
-        std::vector<int> vals_isGenMatched(ncands);
-        std::vector<float> vals_genRecoPtRatio0p2(ncands), vals_genRecoPtRatio0p3(ncands);
+        std::vector<int> vals_isGenMatched(ncands, 0);
+	std::vector<float> vals_genPtSum0p2(ncands, -99.f);
+	std::vector<float> vals_genNeutralPtSum0p2(ncands, -99.f);
+	std::vector<float> vals_genChargedPtSum0p2(ncands, -99.f);
 	
-	std::vector<float> vals_genPtSum0p2(ncands), vals_genNeutralPtSum0p2(ncands),
-                           vals_genChargedPtSum0p2(ncands), vals_genChargedPtHadSum0p2(ncands),
-                           vals_genNeutralPtHadSum0p2(ncands);
-        std::vector<float> vals_recoPtSum0p2(ncands), vals_recoNeutralPtSum0p2(ncands),
-                           vals_recoChargedPtSum0p2(ncands), vals_recoChargedPtHadSum0p2(ncands),
-                           vals_recoNeutralPtHadSum0p2(ncands);
+	std::vector<float> vals_recoPtSum0p2(ncands, -99.f);
+	std::vector<float> vals_recoNeutralPtSum0p2(ncands, -99.f);
+	std::vector<float> vals_recoChargedPtSum0p2(ncands, -99.f);
 
-        std::vector<float> vals_genPtSum0p3(ncands), vals_genNeutralPtSum0p3(ncands),
-                           vals_genChargedPtSum0p3(ncands), vals_genChargedPtHadSum0p3(ncands),
-                           vals_genNeutralPtHadSum0p3(ncands);
-        std::vector<float> vals_recoPtSum0p3(ncands), vals_recoNeutralPtSum0p3(ncands),
-                           vals_recoChargedPtSum0p3(ncands), vals_recoChargedPtHadSum0p3(ncands),
-                           vals_recoNeutralPtHadSum0p3(ncands);
-
-        std::vector<float> vals_caloeta(ncands), vals_calophi(ncands);
-
-        // ---- prepare vectors for gen counters ----
-        std::vector<int> nGenInCone0p1(ncands,0), nGenStatus1InCone0p1(ncands,0),
-                         nGenPtThrInCone0p1(ncands,0), nGenStatus1PtThrInCone0p1(ncands,0);
-        std::vector<int> nChargedGenInCone0p1(ncands,0), nChargedGenStatus1InCone0p1(ncands,0),
-                         nChargedGenPt2InCone0p1(ncands,0), nChargedGenStatus1Pt2InCone0p1(ncands,0);
-        std::vector<int> nNeutralGenInCone0p1(ncands,0), nNeutralGenStatus1InCone0p1(ncands,0),
-                         nNeutralGenPt1InCone0p1(ncands,0), nNeutralGenStatus1Pt1InCone0p1(ncands,0);
-        std::vector<int> nChargedHadGenInCone0p1(ncands,0), nChargedHadGenStatus1InCone0p1(ncands,0),
-                         nChargedHadGenPt2InCone0p1(ncands,0), nChargedHadGenStatus1Pt2InCone0p1(ncands,0);
-        std::vector<int> nNeutralHadGenInCone0p1(ncands,0), nNeutralHadGenStatus1InCone0p1(ncands,0),
-                         nNeutralHadGenPt1InCone0p1(ncands,0), nNeutralHadGenStatus1Pt1InCone0p1(ncands,0);
-
-        // replicate for 0.2 and 0.3
-        std::vector<int> nGenInCone0p2(ncands,0), nGenStatus1InCone0p2(ncands,0),
-                         nGenPtThrInCone0p2(ncands,0), nGenStatus1PtThrInCone0p2(ncands,0);
-        std::vector<int> nChargedGenInCone0p2(ncands,0), nChargedGenStatus1InCone0p2(ncands,0),
-                         nChargedGenPt2InCone0p2(ncands,0), nChargedGenStatus1Pt2InCone0p2(ncands,0);
-        std::vector<int> nNeutralGenInCone0p2(ncands,0), nNeutralGenStatus1InCone0p2(ncands,0),
-                         nNeutralGenPt1InCone0p2(ncands,0), nNeutralGenStatus1Pt1InCone0p2(ncands,0);
-        std::vector<int> nChargedHadGenInCone0p2(ncands,0), nChargedHadGenStatus1InCone0p2(ncands,0),
-                         nChargedHadGenPt2InCone0p2(ncands,0), nChargedHadGenStatus1Pt2InCone0p2(ncands,0);
-        std::vector<int> nNeutralHadGenInCone0p2(ncands,0), nNeutralHadGenStatus1InCone0p2(ncands,0),
-                         nNeutralHadGenPt1InCone0p2(ncands,0), nNeutralHadGenStatus1Pt1InCone0p2(ncands,0);
-
-        std::vector<int> nGenInCone0p3(ncands,0), nGenStatus1InCone0p3(ncands,0),
-                         nGenPtThrInCone0p3(ncands,0), nGenStatus1PtThrInCone0p3(ncands,0);
-        std::vector<int> nChargedGenInCone0p3(ncands,0), nChargedGenStatus1InCone0p3(ncands,0),
-                         nChargedGenPt2InCone0p3(ncands,0), nChargedGenStatus1Pt2InCone0p3(ncands,0);
-        std::vector<int> nNeutralGenInCone0p3(ncands,0), nNeutralGenStatus1InCone0p3(ncands,0),
-                         nNeutralGenPt1InCone0p3(ncands,0), nNeutralGenStatus1Pt1InCone0p3(ncands,0);
-        std::vector<int> nChargedHadGenInCone0p3(ncands,0), nChargedHadGenStatus1InCone0p3(ncands,0),
-                         nChargedHadGenPt2InCone0p3(ncands,0), nChargedHadGenStatus1Pt2InCone0p3(ncands,0);
-        std::vector<int> nNeutralHadGenInCone0p3(ncands,0), nNeutralHadGenStatus1InCone0p3(ncands,0),
-                         nNeutralHadGenPt1InCone0p3(ncands,0), nNeutralHadGenStatus1Pt1InCone0p3(ncands,0);
+	std::vector<float> vals_recoDen_seedPlusCh0p2(ncands, -99.f);
+	std::vector<float> vals_recoDen_seedPlusNe0p2(ncands, -99.f);
+	std::vector<float> vals_recoDen_seedPlusAll0p2(ncands, -99.f);
+	
+	std::vector<float> vals_genChPlusMatchedNe0p2(ncands, -99.f);
+	
+	std::vector<float> vals_ratioPU_ch0p2(ncands, -99.f);
+	std::vector<float> vals_ratioPU_ne0p2(ncands, -99.f);
+	std::vector<float> vals_ratioPU_all0p2(ncands, -99.f);
+	
+	std::vector<int>   vals_hasMatchedGenNeutral(ncands, 0);
+	std::vector<float> vals_matchedGenNeutralPt(ncands, 0.f);
+	
+	// ---- multiplicities (0p2) ----
+	std::vector<int> nRecoInCone0p2(ncands, -1);
+	std::vector<int> nRecoChInCone0p2(ncands, -1);
+	std::vector<int> nRecoNeInCone0p2(ncands, -1);
+	std::vector<int> nRecoPhoInCone0p2(ncands, -1);
+	std::vector<int> nRecoNHadInCone0p2(ncands, -1);
+	std::vector<int> nRecoChHadInCone0p2(ncands, -1);
+	
+	std::vector<int> nGenInCone0p2(ncands, -1);
+	std::vector<int> nGenChInCone0p2(ncands, -1);
+	std::vector<int> nGenNeInCone0p2(ncands, -1);
+	std::vector<int> nGenPhoInCone0p2(ncands, -1);
+	std::vector<int> nGenNHadInCone0p2(ncands, -1);
+	std::vector<int> nGenChHadInCone0p2(ncands, -1);
+	
 
         // ---- main candidate loop ----
+        const float bz = 3.8112;
+	const double cone = 0.2;
+
         for (unsigned int i = 0; i < ncands; ++i) {
-            const auto* cand = selected[i];
-
-            math::XYZTLorentzVector vertex(cand->vx(), cand->vy(), cand->vz(), 0.);
-            auto caloetaphi = l1tpf::propagateToCalo(cand->p4(), vertex, cand->charge(), bz);
-            vals_caloeta[i] = caloetaphi.first;
-            vals_calophi[i] = caloetaphi.second;
-
-            auto sums0p1 = computePtSumsForCone(cand, selected, gen_selected, 0.1, bz);
-            auto sums0p2 = computePtSumsForCone(cand, selected, gen_selected, 0.2, bz);
-            auto sums0p3 = computePtSumsForCone(cand, selected, gen_selected, 0.3, bz);
-
-            // --- store main numeric results (0.2/0.3) ---
-            vals_genPtSum0p2[i] = sums0p2.genPtSum;
-            vals_genNeutralPtSum0p2[i] = sums0p2.genNeutralPtSum;
-            vals_genChargedPtSum0p2[i] = sums0p2.genChargedPtSum;
-            vals_genChargedPtHadSum0p2[i] = sums0p2.genChargedPtHadSum;
-            vals_genNeutralPtHadSum0p2[i] = sums0p2.genNeutralPtHadSum;
-
-            vals_recoPtSum0p2[i] = sums0p2.recoPtSum;
-            vals_recoNeutralPtSum0p2[i] = sums0p2.recoNeutralPtSum;
-            vals_recoChargedPtSum0p2[i] = sums0p2.recoChargedPtSum;
-            vals_recoChargedPtHadSum0p2[i] = sums0p2.recoChargedPtHadSum;
-            vals_recoNeutralPtHadSum0p2[i] = sums0p2.recoNeutralPtHadSum;
-
-            vals_genRecoPtRatio0p2[i] = sums0p2.genRecoRatio;
-            vals_isGenMatched[i] = sums0p2.isGenMatched;
-
-            vals_genPtSum0p3[i] = sums0p3.genPtSum;
-            vals_genNeutralPtSum0p3[i] = sums0p3.genNeutralPtSum;
-            vals_genChargedPtSum0p3[i] = sums0p3.genChargedPtSum;
-            vals_genChargedPtHadSum0p3[i] = sums0p3.genChargedPtHadSum;
-            vals_genNeutralPtHadSum0p3[i] = sums0p3.genNeutralPtHadSum;
-
-            vals_recoPtSum0p3[i] = sums0p3.recoPtSum;
-            vals_recoNeutralPtSum0p3[i] = sums0p3.recoNeutralPtSum;
-            vals_recoChargedPtSum0p3[i] = sums0p3.recoChargedPtSum;
-            vals_recoChargedPtHadSum0p3[i] = sums0p3.recoChargedPtHadSum;
-            vals_recoNeutralPtHadSum0p3[i] = sums0p3.recoNeutralPtHadSum;
-
-            vals_genRecoPtRatio0p3[i] = sums0p3.genRecoRatio;
-
-            // --- store gen counters (0.1/0.2/0.3) ---
-            nGenInCone0p1[i]                = sums0p1.counts.nGenInCone;
-            nGenStatus1InCone0p1[i]         = sums0p1.counts.nGenStatus1InCone;
-            nGenPtThrInCone0p1[i]             = sums0p1.counts.nGenPtThrInCone;
-            nGenStatus1PtThrInCone0p1[i]      = sums0p1.counts.nGenStatus1PtThrInCone;
-            nChargedGenInCone0p1[i]         = sums0p1.counts.nChargedGenInCone;
-            nChargedGenStatus1InCone0p1[i]  = sums0p1.counts.nChargedGenStatus1InCone;
-            nChargedGenPt2InCone0p1[i]      = sums0p1.counts.nChargedGenPt2InCone;
-            nChargedGenStatus1Pt2InCone0p1[i]=sums0p1.counts.nChargedGenStatus1Pt2InCone;
-            nNeutralGenInCone0p1[i]         = sums0p1.counts.nNeutralGenInCone;
-            nNeutralGenStatus1InCone0p1[i]  = sums0p1.counts.nNeutralGenStatus1InCone;
-            nNeutralGenPt1InCone0p1[i]      = sums0p1.counts.nNeutralGenPt1InCone;
-            nNeutralGenStatus1Pt1InCone0p1[i]=sums0p1.counts.nNeutralGenStatus1Pt1InCone;
-            nChargedHadGenInCone0p1[i]      = sums0p1.counts.nChargedHadGenInCone;
-            nChargedHadGenStatus1InCone0p1[i]=sums0p1.counts.nChargedHadGenStatus1InCone;
-            nChargedHadGenPt2InCone0p1[i]   = sums0p1.counts.nChargedHadGenPt2InCone;
-            nChargedHadGenStatus1Pt2InCone0p1[i]=sums0p1.counts.nChargedHadGenStatus1Pt2InCone;
-            nNeutralHadGenInCone0p1[i]      = sums0p1.counts.nNeutralHadGenInCone;
-            nNeutralHadGenStatus1InCone0p1[i]=sums0p1.counts.nNeutralHadGenStatus1InCone;
-            nNeutralHadGenPt1InCone0p1[i]   = sums0p1.counts.nNeutralHadGenPt1InCone;
-            nNeutralHadGenStatus1Pt1InCone0p1[i]=sums0p1.counts.nNeutralHadGenStatus1Pt1InCone;
-
-            // repeat for 0.2 / 0.3
-            nGenInCone0p2[i]                = sums0p2.counts.nGenInCone;
-            nGenStatus1InCone0p2[i]         = sums0p2.counts.nGenStatus1InCone;
-            nGenPtThrInCone0p2[i]             = sums0p2.counts.nGenPtThrInCone;
-            nGenStatus1PtThrInCone0p2[i]      = sums0p2.counts.nGenStatus1PtThrInCone;
-            nChargedGenInCone0p2[i]         = sums0p2.counts.nChargedGenInCone;
-            nChargedGenStatus1InCone0p2[i]  = sums0p2.counts.nChargedGenStatus1InCone;
-            nChargedGenPt2InCone0p2[i]      = sums0p2.counts.nChargedGenPt2InCone;
-            nChargedGenStatus1Pt2InCone0p2[i]=sums0p2.counts.nChargedGenStatus1Pt2InCone;
-            nNeutralGenInCone0p2[i]         = sums0p2.counts.nNeutralGenInCone;
-            nNeutralGenStatus1InCone0p2[i]  = sums0p2.counts.nNeutralGenStatus1InCone;
-            nNeutralGenPt1InCone0p2[i]      = sums0p2.counts.nNeutralGenPt1InCone;
-            nNeutralGenStatus1Pt1InCone0p2[i]=sums0p2.counts.nNeutralGenStatus1Pt1InCone;
-            nChargedHadGenInCone0p2[i]      = sums0p2.counts.nChargedHadGenInCone;
-            nChargedHadGenStatus1InCone0p2[i]=sums0p2.counts.nChargedHadGenStatus1InCone;
-            nChargedHadGenPt2InCone0p2[i]   = sums0p2.counts.nChargedHadGenPt2InCone;
-            nChargedHadGenStatus1Pt2InCone0p2[i]=sums0p2.counts.nChargedHadGenStatus1Pt2InCone;
-            nNeutralHadGenInCone0p2[i]      = sums0p2.counts.nNeutralHadGenInCone;
-            nNeutralHadGenStatus1InCone0p2[i]=sums0p2.counts.nNeutralHadGenStatus1InCone;
-            nNeutralHadGenPt1InCone0p2[i]   = sums0p2.counts.nNeutralHadGenPt1InCone;
-            nNeutralHadGenStatus1Pt1InCone0p2[i]=sums0p2.counts.nNeutralHadGenStatus1Pt1InCone;
-
-            nGenInCone0p3[i]                = sums0p3.counts.nGenInCone;
-            nGenStatus1InCone0p3[i]         = sums0p3.counts.nGenStatus1InCone;
-            nGenPtThrInCone0p3[i]             = sums0p3.counts.nGenPtThrInCone;
-            nGenStatus1PtThrInCone0p3[i]      = sums0p3.counts.nGenStatus1PtThrInCone;
-            nChargedGenInCone0p3[i]         = sums0p3.counts.nChargedGenInCone;
-            nChargedGenStatus1InCone0p3[i]  = sums0p3.counts.nChargedGenStatus1InCone;
-            nChargedGenPt2InCone0p3[i]      = sums0p3.counts.nChargedGenPt2InCone;
-            nChargedGenStatus1Pt2InCone0p3[i]=sums0p3.counts.nChargedGenStatus1Pt2InCone;
-            nNeutralGenInCone0p3[i]         = sums0p3.counts.nNeutralGenInCone;
-            nNeutralGenStatus1InCone0p3[i]  = sums0p3.counts.nNeutralGenStatus1InCone;
-            nNeutralGenPt1InCone0p3[i]      = sums0p3.counts.nNeutralGenPt1InCone;
-            nNeutralGenStatus1Pt1InCone0p3[i]=sums0p3.counts.nNeutralGenStatus1Pt1InCone;
-            nChargedHadGenInCone0p3[i]      = sums0p3.counts.nChargedHadGenInCone;
-            nChargedHadGenStatus1InCone0p3[i]=sums0p3.counts.nChargedHadGenStatus1InCone;
-            nChargedHadGenPt2InCone0p3[i]   = sums0p3.counts.nChargedHadGenPt2InCone;
-            nChargedHadGenStatus1Pt2InCone0p3[i]=sums0p3.counts.nChargedHadGenStatus1Pt2InCone;
-            nNeutralHadGenInCone0p3[i]      = sums0p3.counts.nNeutralHadGenInCone;
-            nNeutralHadGenStatus1InCone0p3[i]=sums0p3.counts.nNeutralHadGenStatus1InCone;
-            nNeutralHadGenPt1InCone0p3[i]   = sums0p3.counts.nNeutralHadGenPt1InCone;
-            nNeutralHadGenStatus1Pt1InCone0p3[i]=sums0p3.counts.nNeutralHadGenStatus1Pt1InCone;
-        }
-
-        // ---- add columns for 0p2 and 0p3 cones ----
-        out->addColumn<float>("genPtSum0p2", vals_genPtSum0p2, "");
-        out->addColumn<float>("genNeutralPtSum0p2", vals_genNeutralPtSum0p2, "");
-        out->addColumn<float>("genChargedPtSum0p2", vals_genChargedPtSum0p2, "");
-        out->addColumn<float>("genChargedHadPtSum0p2", vals_genChargedPtHadSum0p2, "");
-        out->addColumn<float>("genNeutralHadPtSum0p2", vals_genNeutralPtHadSum0p2, "");
-        out->addColumn<float>("recoPtSum0p2", vals_recoPtSum0p2, "");
-        out->addColumn<float>("recoNeutralPtSum0p2", vals_recoNeutralPtSum0p2, "");
-        out->addColumn<float>("recoChargedPtSum0p2", vals_recoChargedPtSum0p2, "");
-        out->addColumn<float>("recoChargedHadPtSum0p2", vals_recoChargedPtHadSum0p2, "");
-        out->addColumn<float>("recoNeutralHadPtSum0p2", vals_recoNeutralPtHadSum0p2, "");
-        out->addColumn<float>("genRecoRatio0p2", vals_genRecoPtRatio0p2, "");
-
-        out->addColumn<float>("genPtSum0p3", vals_genPtSum0p3, "");
-        out->addColumn<float>("genNeutralPtSum0p3", vals_genNeutralPtSum0p3, "");
-        out->addColumn<float>("genChargedPtSum0p3", vals_genChargedPtSum0p3, "");
-        out->addColumn<float>("genChargedHadPtSum0p3", vals_genChargedPtHadSum0p3, "");
-        out->addColumn<float>("genNeutralHadPtSum0p3", vals_genNeutralPtHadSum0p3, "");
-        out->addColumn<float>("recoPtSum0p3", vals_recoPtSum0p3, "");
-        out->addColumn<float>("recoNeutralPtSum0p3", vals_recoNeutralPtSum0p3, "");
-        out->addColumn<float>("recoChargedPtSum0p3", vals_recoChargedPtSum0p3, "");
-        out->addColumn<float>("recoChargedHadPtSum0p3", vals_recoChargedPtHadSum0p3, "");
-        out->addColumn<float>("recoNeutralHadPtSum0p3", vals_recoNeutralPtHadSum0p3, "");
-        out->addColumn<float>("genRecoRatio0p3", vals_genRecoPtRatio0p3, "");
-        out->addColumn<int>("isGenMatched", vals_isGenMatched, "");
-        out->addColumn<float>("caloeta", vals_caloeta, "");
-        out->addColumn<float>("calophi", vals_calophi, "");
-
-	// ----------------------------------------------------------------------
-	// Adds GEN count columns conditionally, based on the column mask.
-	// ----------------------------------------------------------------------
-	auto addCounts = [&](const std::string &prefix,
-			     const std::string &cone,
-			     const std::vector<int> &InCone,
-			     const std::vector<int> &Status1InCone,
-			     const std::vector<int> &PtThrInCone,
-			     const std::vector<int> &Pt1InCone,
-			     const std::vector<int> &Pt2InCone,
-			     const std::vector<int> &Status1PtThrInCone,
-			     const std::vector<int> &Status1Pt1InCone,
-			     const std::vector<int> &Status1Pt2InCone,
-			     const GenColumnMask &mask)
-	{
-	  out->addColumn<int>(prefix+"InCone"+cone,        InCone,        "");
-	  out->addColumn<int>(prefix+"Status1InCone"+cone, Status1InCone, "");
+	  const auto* cand = selected[i];
 	  
-	  if (mask.makePtThr){
-	    out->addColumn<int>(prefix+"PtThrInCone"+cone, PtThrInCone, "");
-	    out->addColumn<int>(prefix+"Status1PtThrInCone"+cone, Status1PtThrInCone, "");
-	  }
-	  if (mask.makePt1) {
-	    out->addColumn<int>(prefix+"Pt1InCone"+cone, Pt1InCone, "");
-	    out->addColumn<int>(prefix+"Status1Pt1InCone"+cone, Status1Pt1InCone, "");
+	  // always fill calo for completeness
+	  math::XYZTLorentzVector vertex(cand->vx(), cand->vy(), cand->vz(), 0.);
+	  auto caloetaphi = l1tpf::propagateToCalo(cand->p4(), vertex, cand->charge(), bz);
+	  vals_caloeta[i] = caloetaphi.first;
+	  vals_calophi[i] = caloetaphi.second;
+	  
+	  // Only neutral reco seeds
+	  if (cand->charge() != 0) {
+	    // leave sentinels
+	    vals_isGenMatched[i] = 0;
+	    continue;
 	  }
 	  
-	  if (mask.makePt2){
-	    out->addColumn<int>(prefix+"Pt2InCone"+cone, Pt2InCone, "");
-	    out->addColumn<int>(prefix+"Status1Pt2InCone"+cone,  Status1Pt2InCone, "");
-	  }
-	};
+	  // ---Compute cone around neutral reco seed
+	  auto coneRes = computeConeAroundNeutralRecoSeed(cand, selected, gen_selected, cone, bz);
 
-	// -------------- GEN total (PtThr only) -----------------
-	{
-	  GenColumnMask mask;
-	  mask.makePtThr = true;
+	  const float r_ch  = (coneRes.recoDen_seedPlusCh  > 0) ? (coneRes.genChargedPlusMatchedNeutral / coneRes.recoDen_seedPlusCh) : -1.f;
+	  const float r_ne  = (coneRes.recoDen_seedPlusNe  > 0) ? (coneRes.ne.genSum / coneRes.recoDen_seedPlusNe) : -1.f;
+	  const float r_all = (coneRes.recoDen_seedPlusAll > 0) ? (coneRes.all.genSum / coneRes.recoDen_seedPlusAll) : -1.f;
 	  
-	  addCounts("nGen", "0p1",
-		    nGenInCone0p1, nGenStatus1InCone0p1,
-		    nGenPtThrInCone0p1, {}, {},
-		    nGenStatus1PtThrInCone0p1, {}, {},
-		    mask);
+	  // ---Debug printout
+	  //if (coneRes.hasMatchedGenNeutral ||
+	  //    (r_ch  > 0.8 && r_ch  < 1.2) ||
+	  //    (r_ne  > 0.8 && r_ne  < 1.2) ||
+	  //    (r_all > 0.8 && r_all < 1.2)) {
+	  //  printConeDebugFull(iEvent.id(), cand, selected, gen_selected, coneRes, cone, bz);
+	  //}
 	  
-	  addCounts("nGen", "0p2",
-		    nGenInCone0p2, nGenStatus1InCone0p2,
-		    nGenPtThrInCone0p2, {}, {},
-		    nGenStatus1PtThrInCone0p2, {}, {},
-		    mask);
+	  // ---- sums (same names where possible) ----
+	  vals_genPtSum0p2[i]         = coneRes.all.genSum;
+	  vals_genNeutralPtSum0p2[i]  = coneRes.ne.genSum;
+	  vals_genChargedPtSum0p2[i]  = coneRes.ch.genSum;
 	  
-	  addCounts("nGen", "0p3",
-		    nGenInCone0p3, nGenStatus1InCone0p3,
-		    nGenPtThrInCone0p3, {}, {},
-		    nGenStatus1PtThrInCone0p3, {}, {},
-		    mask);
+	  vals_recoPtSum0p2[i]        = coneRes.all.recoSum;
+	  vals_recoNeutralPtSum0p2[i] = coneRes.ne.recoSum;
+	  vals_recoChargedPtSum0p2[i] = coneRes.ch.recoSum;
+
+	  vals_recoDen_seedPlusCh0p2[i]  = coneRes.recoDen_seedPlusCh;
+	  vals_recoDen_seedPlusNe0p2[i]  = coneRes.recoDen_seedPlusNe;
+	  vals_recoDen_seedPlusAll0p2[i] = coneRes.recoDen_seedPlusAll;
+	  
+	  vals_genChPlusMatchedNe0p2[i]  = coneRes.genChargedPlusMatchedNeutral;
+	  
+	  vals_ratioPU_ch0p2[i]  = (coneRes.recoDen_seedPlusCh  > 0) ? (coneRes.genChargedPlusMatchedNeutral / coneRes.recoDen_seedPlusCh)  : -1.f;
+	  vals_ratioPU_ne0p2[i]  = (coneRes.recoDen_seedPlusNe  > 0) ? (coneRes.ne.genSum         / coneRes.recoDen_seedPlusNe)  : -1.f;
+	  vals_ratioPU_all0p2[i] = (coneRes.recoDen_seedPlusAll > 0) ? (coneRes.all.genSum        / coneRes.recoDen_seedPlusAll) : -1.f;
+	  
+	  vals_hasMatchedGenNeutral[i] = coneRes.hasMatchedGenNeutral;
+	  vals_matchedGenNeutralPt[i]  = coneRes.matchedGenNeutralPt;
+ 
+	  // ---- matching ----
+	  vals_isGenMatched[i] = coneRes.isGenMatched;
+	  
+	  // ---- multiplicities (0p2) ----
+	  nRecoInCone0p2[i]     = coneRes.mult.nRecoAll;
+	  nRecoChInCone0p2[i]   = coneRes.mult.nRecoCh;
+	  nRecoNeInCone0p2[i]   = coneRes.mult.nRecoNe;
+	  nRecoPhoInCone0p2[i]  = coneRes.mult.nRecoPho;
+	  nRecoNHadInCone0p2[i] = coneRes.mult.nRecoNHad;
+	  nRecoChHadInCone0p2[i]= coneRes.mult.nRecoChHad;
+	  
+	  nGenInCone0p2[i]      = coneRes.mult.nGenAll;
+	  nGenChInCone0p2[i]    = coneRes.mult.nGenCh;
+	  nGenNeInCone0p2[i]    = coneRes.mult.nGenNe;
+	  nGenPhoInCone0p2[i]   = coneRes.mult.nGenPho;
+	  nGenNHadInCone0p2[i]  = coneRes.mult.nGenNHad;
+	  nGenChHadInCone0p2[i] = coneRes.mult.nGenChHad;
 	}
 	
-	// -------------- Charged (Pt2 only) -----------------
-	{
-	  GenColumnMask mask;
-	  mask.makePt2 = true;
-	  
-	  addCounts("nChargedGen", "0p1",
-		    nChargedGenInCone0p1, nChargedGenStatus1InCone0p1,
-		    {}, {}, nChargedGenPt2InCone0p1,
-		    {}, {}, nChargedGenStatus1Pt2InCone0p1,
-		    mask);
-	  
-	  addCounts("nChargedGen", "0p2",
-		    nChargedGenInCone0p2, nChargedGenStatus1InCone0p2,
-		    {}, {}, nChargedGenPt2InCone0p2,
-		    {}, {}, nChargedGenStatus1Pt2InCone0p2,
-		    mask);
-	  
-	  addCounts("nChargedGen", "0p3",
-		    nChargedGenInCone0p3, nChargedGenStatus1InCone0p3,
-		    {}, {}, nChargedGenPt2InCone0p3,
-		    {}, {}, nChargedGenStatus1Pt2InCone0p3,
-		    mask);
-	}
+	// ---- Add columns for target studies (0p2 cone) ----
+	// ---------------------------------------------------
+	// ---- sums  ----
+	out->addColumn<float>("genPtSum0p2",         vals_genPtSum0p2,         "GEN all (status1+thr) pT sum in dR=0.2 around neutral RECO seed");
+	out->addColumn<float>("genNeutralPtSum0p2",  vals_genNeutralPtSum0p2,  "GEN neutral (status1+thr) pT sum in dR=0.2 around neutral RECO seed");
+	out->addColumn<float>("genChargedPtSum0p2",  vals_genChargedPtSum0p2,  "GEN charged (status1+thr) pT sum in dR=0.2 around neutral RECO seed");
 	
-	// -------------- Neutral (Pt1 only) -----------------
-	{
-	  GenColumnMask mask;
-	  mask.makePt1 = true;
-	  
-	  addCounts("nNeutralGen", "0p1",
-		    nNeutralGenInCone0p1, nNeutralGenStatus1InCone0p1,
-		    {}, nNeutralGenPt1InCone0p1, {},
-		    {}, nNeutralGenStatus1Pt1InCone0p1, {},
-		    mask);
-	  
-	  addCounts("nNeutralGen", "0p2",
-		    nNeutralGenInCone0p2, nNeutralGenStatus1InCone0p2,
-		    {}, nNeutralGenPt1InCone0p2, {},
-		    {}, nNeutralGenStatus1Pt1InCone0p2, {},
-		    mask);
-	  
-	  addCounts("nNeutralGen", "0p3",
-		    nNeutralGenInCone0p3, nNeutralGenStatus1InCone0p3,
-		    {}, nNeutralGenPt1InCone0p3, {},
-		    {}, nNeutralGenStatus1Pt1InCone0p3, {},
-		    mask);
-	}
+	out->addColumn<float>("recoPtSum0p2",        vals_recoPtSum0p2,        "RECO all pT sum in dR=0.2 around neutral RECO seed");
+	out->addColumn<float>("recoNeutralPtSum0p2", vals_recoNeutralPtSum0p2, "RECO neutral pT sum in dR=0.2 around neutral RECO seed");
+	out->addColumn<float>("recoChargedPtSum0p2", vals_recoChargedPtSum0p2, "RECO charged pT sum in dR=0.2 around neutral RECO seed");
+
+	out->addColumn<float>("recoDen_seedPlusCh0p2",  vals_recoDen_seedPlusCh0p2,  "Denominator: seed + reco charged in cone");
+	out->addColumn<float>("recoDen_seedPlusNe0p2",  vals_recoDen_seedPlusNe0p2,  "Denominator: seed + reco neutral in cone");
+	out->addColumn<float>("recoDen_seedPlusAll0p2", vals_recoDen_seedPlusAll0p2, "Denominator: seed + reco all in cone");
 	
-	// -------------- Charged Had (Pt2 only) -----------------
-	{
-	  GenColumnMask mask;
-	  mask.makePt2 = true;
-	  
-	  addCounts("nChargedHadGen", "0p1",
-		    nChargedHadGenInCone0p1, nChargedHadGenStatus1InCone0p1,
-		    {}, {}, nChargedHadGenPt2InCone0p1,
-		    {}, {}, nChargedHadGenStatus1Pt2InCone0p1,
-		    mask);
-	  
-	  addCounts("nChargedHadGen", "0p2",
-		    nChargedHadGenInCone0p2, nChargedHadGenStatus1InCone0p2,
-		    {}, {}, nChargedHadGenPt2InCone0p2,
-		    {}, {}, nChargedHadGenStatus1Pt2InCone0p2,
-		    mask);
-	  
-	  addCounts("nChargedHadGen", "0p3",
-		    nChargedHadGenInCone0p3, nChargedHadGenStatus1InCone0p3,
-		    {}, {}, nChargedHadGenPt2InCone0p3,
-		    {}, {}, nChargedHadGenStatus1Pt2InCone0p3,
-		    mask);
-	}       
-
-	// -------------- Neutral Had (Pt1 only) -----------------
-	{
-	  GenColumnMask mask;
-	  mask.makePt1 = true;
-	  
-	  addCounts("nNeutralHadGen", "0p1",
-		    nNeutralHadGenInCone0p1, nNeutralHadGenStatus1InCone0p1,
-		    {}, nNeutralHadGenPt1InCone0p1, {},
-		    {}, nNeutralHadGenStatus1Pt1InCone0p1, {},
-		    mask);
-	  
-	  addCounts("nNeutralHadGen", "0p2",
-		    nNeutralHadGenInCone0p2, nNeutralHadGenStatus1InCone0p2,
-		    {}, nNeutralHadGenPt1InCone0p2, {},
-		    {}, nNeutralHadGenStatus1Pt1InCone0p2, {},
-		    mask);
-	  
-	  addCounts("nNeutralHadGen", "0p3",
-		    nNeutralHadGenInCone0p3, nNeutralHadGenStatus1InCone0p3,
-		    {}, nNeutralHadGenPt1InCone0p3, {},
-              {}, nNeutralHadGenStatus1Pt1InCone0p3, {},
-		    mask);
-	}
-
-	// ---- save to event ----
+	out->addColumn<float>("genChPlusMatchedNe0p2",  vals_genChPlusMatchedNe0p2,  "Numerator: gen charged + matched neutral (if any)");
+	
+	out->addColumn<float>("ratioPU_ch0p2",  vals_ratioPU_ch0p2,  "PU-style ratio: (gen charged + matched neutral) / (seed + reco charged)");
+	out->addColumn<float>("ratioPU_ne0p2",  vals_ratioPU_ne0p2,  "PU-style ratio: gen neutral / (seed + reco neutral)");
+	out->addColumn<float>("ratioPU_all0p2", vals_ratioPU_all0p2, "PU-style ratio: gen all / (seed + reco all)");
+	
+	out->addColumn<int>  ("hasMatchedGenNeutral", vals_hasMatchedGenNeutral, "1 if a matched GEN neutral was found");
+	out->addColumn<float>("matchedGenNeutralPt",  vals_matchedGenNeutralPt,  "pT of matched GEN neutral (0 if none)");
+ 
+	// ---- matching + calo ----
+	out->addColumn<int>("isGenMatched", vals_isGenMatched, "1 if any GEN status1 passing threshold is within dR<0.2 of neutral RECO seed");
+	out->addColumn<float>("caloeta", vals_caloeta, "");
+	out->addColumn<float>("calophi", vals_calophi, "");
+	
+	// ---- multiplicities (0p2) ----
+	out->addColumn<int>("nRecoInCone0p2",     nRecoInCone0p2,     "");
+	out->addColumn<int>("nRecoChInCone0p2",   nRecoChInCone0p2,   "");
+	out->addColumn<int>("nRecoNeInCone0p2",   nRecoNeInCone0p2,   "");
+	out->addColumn<int>("nRecoPhoInCone0p2",  nRecoPhoInCone0p2,  "");
+	out->addColumn<int>("nRecoNHadInCone0p2", nRecoNHadInCone0p2, "");
+	out->addColumn<int>("nRecoChHadInCone0p2",nRecoChHadInCone0p2,"");
+	
+	out->addColumn<int>("nGenInCone0p2",      nGenInCone0p2,      "");
+	out->addColumn<int>("nGenChInCone0p2",    nGenChInCone0p2,    "");
+	out->addColumn<int>("nGenNeInCone0p2",    nGenNeInCone0p2,    "");
+	out->addColumn<int>("nGenPhoInCone0p2",   nGenPhoInCone0p2,   "");
+	out->addColumn<int>("nGenNHadInCone0p2",  nGenNHadInCone0p2,  "");
+	out->addColumn<int>("nGenChHadInCone0p2", nGenChHadInCone0p2, "");
+	
+	// ---- Save to event ----
         iEvent.put(std::move(out), cands.coll+"Cands");
         selected.clear();
     }
