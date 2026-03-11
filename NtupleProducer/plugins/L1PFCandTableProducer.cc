@@ -100,8 +100,7 @@ L1PFCandTableProducer::~L1PFCandTableProducer() { }
 //       2) neutral-around-neutral-seed   (includes seed)
 //       3) all-around-neutral-seed       (includes seed)
 //   - GEN thresholds kept: charged >2 GeV, neutral >1 GeV (status==1 for sums/counts)
-//   - Keep matching logic (isGenMatched) using GEN status1 passing thresholds within dR < 0.2
-//   - Keep suspicious printout (~0.5 bulk) + add "Gen sum peaking at zero"
+//   - Updated matching logic (isGenMatched) using GEN status1 and passing thresholds, within dR < 0.1 and a minimum pt compatibility
 // =====================================================================================
 
 static inline double dR(double eta1,double phi1,double eta2,double phi2){
@@ -397,7 +396,8 @@ static inline ConeResult computeConeAroundNeutralRecoSeed(
     // --- improved matching: neutral only, pt-compatible, best DR ---
     if (g->charge() != 0) continue;
 
-    const double rel = (seed->pt()>0 ? std::abs(g->pt()-seed->pt())/seed->pt() : 999.);
+    //const double rel = (seed->pt()>0 ? std::abs(g->pt()-seed->pt())/seed->pt() : 999.);
+    const double rel = (seed->pt()>0 ? (g->pt()-seed->pt())/seed->pt() : 999.);
     if (rel > relPtTol) continue;
 
     if (dr < bestDR) { bestDR = dr; bestGenNeutral = gp; }
